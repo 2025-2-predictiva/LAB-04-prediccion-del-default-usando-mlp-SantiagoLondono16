@@ -96,3 +96,287 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import gzip
+import json
+import os
+import pickle
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+def load_and_clean_data():
+    """
+    Paso 1: Load and clean the datasets
+    """
+    # Load train data
+    train_data = pd.read_csv("files/input/train_data.csv.zip", compression="zip")
+    # Load test data
+    test_data = pd.read_csv("files/input/test_data.csv.zip", compression="zip")
+
+    # Rename column
+    train_data = train_data.rename(columns={"default payment next month": "default"})
+    test_data = test_data.rename(columns={"default payment next month": "default"})
+
+    # Remove ID column
+    if "ID" in train_data.columns:
+        train_data = train_data.drop(columns=["ID"])
+    if "ID" in test_data.columns:
+        test_data = test_data.drop(columns=["ID"])
+
+    # Remove records with missing values
+    train_data = train_data.dropna()
+    test_data = test_data.dropna()
+
+    # Group EDUCATION values > 4 into "others" (4)
+    train_data["EDUCATION"] = train_data["EDUCATION"].apply(lambda x: 4 if x > 4 else x)
+    test_data["EDUCATION"] = test_data["EDUCATION"].apply(lambda x: 4 if x > 4 else x)
+
+    return train_data, test_data
+
+
+def split_data(train_data, test_data):
+    """
+    Paso 2: Split datasets into x and y
+    """
+    x_train = train_data.drop(columns=["default"])
+    y_train = train_data["default"]
+
+    x_test = test_data.drop(columns=["default"])
+    y_test = test_data["default"]
+
+    return x_train, y_train, x_test, y_test
+
+
+def create_pipeline(x_train):
+    """
+    Paso 3: Create ML pipeline
+    """
+    # Identify categorical columns
+    categorical_columns = ["SEX", "EDUCATION", "MARRIAGE"]
+
+    # Identify numerical columns
+    numerical_columns = [col for col in x_train.columns if col not in categorical_columns]
+
+    # Create preprocessor for categorical and numerical features
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(drop="first", sparse_output=False), categorical_columns),
+            ("num", "passthrough", numerical_columns),
+        ]
+    )
+
+    # Create pipeline
+    pipeline = Pipeline(
+        [
+            ("preprocessor", preprocessor),
+            ("pca", PCA()),  # Use all components by default
+            ("scaler", StandardScaler()),  # Standardize features
+            ("selector", SelectKBest(score_func=f_classif)),
+            ("classifier", MLPClassifier(max_iter=1000, random_state=42)),
+        ]
+    )
+
+    return pipeline
+
+
+def optimize_hyperparameters(pipeline, x_train, y_train, quick_mode=False):
+    """
+    Paso 4: Optimize hyperparameters using GridSearchCV
+    """
+    if quick_mode:
+        # Optimized parameter grid for good performance with reasonable training time
+        param_grid = {
+            "pca__n_components": [20, 25],
+            "selector__k": [20, 25],
+            "classifier__hidden_layer_sizes": [(100,), (100, 50), (100, 100)],
+            "classifier__activation": ["relu"],
+            "classifier__alpha": [0.0001, 0.001],
+        }
+        cv_splits = 10  # Use 10-fold cross-validation as required
+    else:
+        # Full parameter grid for comprehensive search
+        param_grid = {
+            "pca__n_components": [15, 20, 25, 30],
+            "selector__k": [15, 20, 25, 30],
+            "classifier__hidden_layer_sizes": [(50,), (100,), (100, 50), (100, 100), (150,)],
+            "classifier__activation": ["relu", "tanh"],
+            "classifier__alpha": [0.00001, 0.0001, 0.001, 0.01],
+        }
+        cv_splits = 10
+
+    # Create GridSearchCV with cross-validation
+    grid_search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=cv_splits,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        verbose=1,
+    )
+
+    return grid_search
+
+
+def save_model(model, filename="files/models/model.pkl.gz"):
+    """
+    Paso 5: Save model as compressed pickle
+    """
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with gzip.open(filename, "wb") as f:
+        pickle.dump(model, f)
+
+
+def calculate_metrics(model, x_train, y_train, x_test, y_test):
+    """
+    Paso 6: Calculate metrics for train and test sets
+    """
+    metrics = []
+
+    # Predictions
+    y_train_pred = model.predict(x_train)
+    y_test_pred = model.predict(x_test)
+
+    # Train metrics
+    train_metrics = {
+        "type": "metrics",
+        "dataset": "train",
+        "precision": float(precision_score(y_train, y_train_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_train, y_train_pred)),
+        "recall": float(recall_score(y_train, y_train_pred)),
+        "f1_score": float(f1_score(y_train, y_train_pred)),
+    }
+    metrics.append(train_metrics)
+
+    # Test metrics
+    test_metrics = {
+        "type": "metrics",
+        "dataset": "test",
+        "precision": float(precision_score(y_test, y_test_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_test, y_test_pred)),
+        "recall": float(recall_score(y_test, y_test_pred)),
+        "f1_score": float(f1_score(y_test, y_test_pred)),
+    }
+    metrics.append(test_metrics)
+
+    return metrics, y_train_pred, y_test_pred
+
+
+def calculate_confusion_matrices(y_train, y_train_pred, y_test, y_test_pred):
+    """
+    Paso 7: Calculate confusion matrices
+    """
+    cm_train = confusion_matrix(y_train, y_train_pred)
+    cm_test = confusion_matrix(y_test, y_test_pred)
+
+    # Format confusion matrix for train
+    cm_train_dict = {
+        "type": "cm_matrix",
+        "dataset": "train",
+        "true_0": {
+            "predicted_0": int(cm_train[0, 0]),
+            "predicted_1": int(cm_train[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm_train[1, 0]),
+            "predicted_1": int(cm_train[1, 1]),
+        },
+    }
+
+    # Format confusion matrix for test
+    cm_test_dict = {
+        "type": "cm_matrix",
+        "dataset": "test",
+        "true_0": {
+            "predicted_0": int(cm_test[0, 0]),
+            "predicted_1": int(cm_test[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm_test[1, 0]),
+            "predicted_1": int(cm_test[1, 1]),
+        },
+    }
+
+    return [cm_train_dict, cm_test_dict]
+
+
+def save_metrics(metrics, cm_matrices, filename="files/output/metrics.json"):
+    """
+    Save metrics to JSON file
+    """
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+    with open(filename, "w", encoding="utf-8") as f:
+        for metric in metrics:
+            f.write(json.dumps(metric) + "\n")
+        for cm in cm_matrices:
+            f.write(json.dumps(cm) + "\n")
+
+
+def main(run_training=True, quick_mode=False):
+    """
+    Main execution function
+    
+    Args:
+        run_training: If True, trains the model. If False, skips training.
+        quick_mode: If True, uses minimal hyperparameters for faster training.
+    """
+    # Paso 1: Load and clean data
+    print("Step 1: Loading and cleaning data...")
+    train_data, test_data = load_and_clean_data()
+
+    # Paso 2: Split data
+    print("Step 2: Splitting data...")
+    x_train, y_train, x_test, y_test = split_data(train_data, test_data)
+
+    # Paso 3: Create pipeline
+    print("Step 3: Creating pipeline...")
+    pipeline = create_pipeline(x_train)
+
+    # Paso 4: Optimize hyperparameters
+    print("Step 4: Optimizing hyperparameters...")
+    grid_search = optimize_hyperparameters(pipeline, x_train, y_train, quick_mode=quick_mode)
+
+    if run_training:
+        # Train the model (COMPUTATIONALLY INTENSIVE)
+        print("Step 4: Training model (this may take a while)...")
+        grid_search.fit(x_train, y_train)
+
+        # Paso 5: Save model
+        print("Step 5: Saving model...")
+        save_model(grid_search)
+
+        # Paso 6 & 7: Calculate and save metrics
+        print("Step 6 & 7: Calculating and saving metrics...")
+        metrics, y_train_pred, y_test_pred = calculate_metrics(grid_search, x_train, y_train, x_test, y_test)
+        cm_matrices = calculate_confusion_matrices(y_train, y_train_pred, y_test, y_test_pred)
+        save_metrics(metrics, cm_matrices)
+
+        print("Done!")
+    else:
+        print("Training skipped. Set run_training=True to train the model.")
+
+
+if __name__ == "__main__":
+    # For full training with extensive hyperparameter search, use:
+    # main(run_training=True, quick_mode=False)
+    
+    # For quick training with minimal hyperparameters, use:
+    main(run_training=True, quick_mode=True)
+    
+    # To skip training entirely, use:
+    # main(run_training=False)
